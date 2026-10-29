@@ -1,0 +1,188 @@
+{
+  "name": "Shopify / Customer Segments",
+  "nodes": [
+    {
+      "id": "5889b95a-fd88-4632-bcdd-7d12330e1ff2",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "8992f2f3-d8df-46a3-a27a-26b43876bd90",
+      "name": "Cursor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// RFM-style customer segments as Shopify customer tags (\"seg:vip\", \"seg:at_risk\", ...), so marketing tools, Shopify\n// customer segments, discounts and support all see the same groups. Plain JS, no imports: build.mjs pastes it into the\n// n8n Code nodes; tests run the same functions.\n\nconst DEFAULTS = {\n  prefix: 'seg:',\n  vipSpend: 1000,    // lifetime spend (shop currency) ...\n  vipOrders: 8,      // ... or this many orders = VIP, while still active\n  loyalOrders: 3,\n  newDays: 30,       // first order this recent = new\n  atRiskDays: 90,    // repeat customer quiet for longer than this = at risk\n  lapsedDays: 180,   // no order for longer than this = lapsed\n  batchSize: 25,     // customers per GraphQL mutation request\n};\nconst cfgOf = (c) => ({ ...DEFAULTS, ...(c || {}) });\nconst num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };\nconst SEGMENTS = ['vip', 'loyal', 'active', 'new', 'one_time', 'at_risk', 'lapsed'];\n\n// customer: GraphQL Customer node. Returns one segment name, or null for customers with no orders.\nfunction segmentOf(customer, now, c) {\n  const cfg = cfgOf(c);\n  const orders = num(customer.numberOfOrders);\n  const last = customer.lastOrder && customer.lastOrder.createdAt;\n  if (!orders || !last) return null;\n  const quiet = (new Date(now).getTime() - new Date(last).getTime()) / 86400000;\n  const spent = num(customer.amountSpent && customer.amountSpent.amount);\n  if (quiet > cfg.lapsedDays) return 'lapsed';\n  if (quiet > cfg.atRiskDays) return orders >= 2 ? 'at_risk' : 'one_time';\n  if (spent >= cfg.vipSpend || orders >= cfg.vipOrders) return 'vip';\n  if (orders >= cfg.loyalOrders) return 'loyal';\n  if (orders === 1) return quiet <= cfg.newDays ? 'new' : 'one_time';\n  return 'active';\n}\n\n// Only touches tags with our prefix; every other tag on the customer is left alone.\nfunction tagChanges(customer, segment, c) {\n  const cfg = cfgOf(c);\n  const ours = (customer.tags || []).filter((t) => t.startsWith(cfg.prefix));\n  const want = segment ? [cfg.prefix + segment] : [];\n  return { add: want.filter((t) => !ours.includes(t)), remove: ours.filter((t) => !want.includes(t)) };\n}\n\n// One page of customers -> the changes to make + per-segment counts.\nfunction planPage(customers, now, c) {\n  const cfg = cfgOf(c);\n  const counts = {};\n  const changes = [];\n  for (const cu of customers || []) {\n    const seg = segmentOf(cu, now, cfg);\n    counts[seg || 'none'] = (counts[seg || 'none'] || 0) + 1;\n    const ch = tagChanges(cu, seg, cfg);\n    if (ch.add.length || ch.remove.length) changes.push({ id: cu.id, name: cu.displayName, segment: seg, ...ch });\n  }\n  return { changes, counts };\n}\n\n// Changes -> GraphQL mutation documents, batchSize customers each, using aliases (a0, r0, ...) so one request\n// updates many customers. JSON.stringify produces valid GraphQL string literals for ids and tags.\nfunction mutationBatches(changes, c) {\n  const cfg = cfgOf(c);\n  const docs = [];\n  for (let i = 0; i < changes.length; i += cfg.batchSize) {\n    const parts = [];\n    changes.slice(i, i + cfg.batchSize).forEach((ch, j) => {\n      const id = JSON.stringify(ch.id);\n      if (ch.add.length) parts.push(`a${j}: tagsAdd(id: ${id}, tags: ${JSON.stringify(ch.add)}) { userErrors { field message } }`);\n      if (ch.remove.length) parts.push(`r${j}: tagsRemove(id: ${id}, tags: ${JSON.stringify(ch.remove)}) { userErrors { field message } }`);\n    });\n    docs.push({ query: `mutation { ${parts.join(' ')} }`, customers: Math.min(cfg.batchSize, changes.length - i) });\n  }\n  return docs;\n}\n\n// Throws on GraphQL errors or any per-customer userErrors, so the cursor doesn't move past a failed page.\nfunction checkMutation(res) {\n  if (res.errors && res.errors.length) throw new Error('Shopify GraphQL: ' + res.errors.map((e) => e.message).join('; '));\n  const bad = [];\n  for (const [alias, r] of Object.entries(res.data || {})) for (const e of (r && r.userErrors) || []) bad.push(`${alias}: ${e.message}`);\n  if (bad.length) throw new Error('Shopify tag update failed: ' + bad.join('; '));\n  return Object.keys(res.data || {}).length;\n}\n\n// Rolling cursor: each run handles the next page; after the last page it starts over.\nconst nextCursor = (pageInfo) => (pageInfo && pageInfo.hasNextPage ? pageInfo.endCursor : null);\n\nconst CONFIG = {\"prefix\":\"seg:\",\"vipSpend\":1000,\"vipOrders\":8,\"loyalOrders\":3,\"newDays\":30,\"atRiskDays\":90,\"lapsedDays\":180,\"batchSize\":25};\n\n// ---- Cursor ----\nreturn [{ json: { after: $getWorkflowStaticData('global').cursor || null } }];\n"
+      }
+    },
+    {
+      "id": "3b19402a-4ba1-4b6f-9d9a-dea01dc2b114",
+      "name": "Get Customers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "shopifyAccessTokenApi": {
+          "id": "SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify Access Token"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-store.myshopify.com/admin/api/2026-07/graphql.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "shopifyAccessTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: \"query($after: String, $n: Int!) { customers(first: $n, after: $after, query: \\\"orders_count:>0\\\", sortKey: ID) { pageInfo { hasNextPage endCursor } nodes { id displayName tags numberOfOrders amountSpent { amount currencyCode } lastOrder { createdAt } } } }\", variables: { after: $json.after, n: 100 } }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "72ccfa1b-b2c8-48ce-8c11-955956046666",
+      "name": "Plan Tags",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// RFM-style customer segments as Shopify customer tags (\"seg:vip\", \"seg:at_risk\", ...), so marketing tools, Shopify\n// customer segments, discounts and support all see the same groups. Plain JS, no imports: build.mjs pastes it into the\n// n8n Code nodes; tests run the same functions.\n\nconst DEFAULTS = {\n  prefix: 'seg:',\n  vipSpend: 1000,    // lifetime spend (shop currency) ...\n  vipOrders: 8,      // ... or this many orders = VIP, while still active\n  loyalOrders: 3,\n  newDays: 30,       // first order this recent = new\n  atRiskDays: 90,    // repeat customer quiet for longer than this = at risk\n  lapsedDays: 180,   // no order for longer than this = lapsed\n  batchSize: 25,     // customers per GraphQL mutation request\n};\nconst cfgOf = (c) => ({ ...DEFAULTS, ...(c || {}) });\nconst num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };\nconst SEGMENTS = ['vip', 'loyal', 'active', 'new', 'one_time', 'at_risk', 'lapsed'];\n\n// customer: GraphQL Customer node. Returns one segment name, or null for customers with no orders.\nfunction segmentOf(customer, now, c) {\n  const cfg = cfgOf(c);\n  const orders = num(customer.numberOfOrders);\n  const last = customer.lastOrder && customer.lastOrder.createdAt;\n  if (!orders || !last) return null;\n  const quiet = (new Date(now).getTime() - new Date(last).getTime()) / 86400000;\n  const spent = num(customer.amountSpent && customer.amountSpent.amount);\n  if (quiet > cfg.lapsedDays) return 'lapsed';\n  if (quiet > cfg.atRiskDays) return orders >= 2 ? 'at_risk' : 'one_time';\n  if (spent >= cfg.vipSpend || orders >= cfg.vipOrders) return 'vip';\n  if (orders >= cfg.loyalOrders) return 'loyal';\n  if (orders === 1) return quiet <= cfg.newDays ? 'new' : 'one_time';\n  return 'active';\n}\n\n// Only touches tags with our prefix; every other tag on the customer is left alone.\nfunction tagChanges(customer, segment, c) {\n  const cfg = cfgOf(c);\n  const ours = (customer.tags || []).filter((t) => t.startsWith(cfg.prefix));\n  const want = segment ? [cfg.prefix + segment] : [];\n  return { add: want.filter((t) => !ours.includes(t)), remove: ours.filter((t) => !want.includes(t)) };\n}\n\n// One page of customers -> the changes to make + per-segment counts.\nfunction planPage(customers, now, c) {\n  const cfg = cfgOf(c);\n  const counts = {};\n  const changes = [];\n  for (const cu of customers || []) {\n    const seg = segmentOf(cu, now, cfg);\n    counts[seg || 'none'] = (counts[seg || 'none'] || 0) + 1;\n    const ch = tagChanges(cu, seg, cfg);\n    if (ch.add.length || ch.remove.length) changes.push({ id: cu.id, name: cu.displayName, segment: seg, ...ch });\n  }\n  return { changes, counts };\n}\n\n// Changes -> GraphQL mutation documents, batchSize customers each, using aliases (a0, r0, ...) so one request\n// updates many customers. JSON.stringify produces valid GraphQL string literals for ids and tags.\nfunction mutationBatches(changes, c) {\n  const cfg = cfgOf(c);\n  const docs = [];\n  for (let i = 0; i < changes.length; i += cfg.batchSize) {\n    const parts = [];\n    changes.slice(i, i + cfg.batchSize).forEach((ch, j) => {\n      const id = JSON.stringify(ch.id);\n      if (ch.add.length) parts.push(`a${j}: tagsAdd(id: ${id}, tags: ${JSON.stringify(ch.add)}) { userErrors { field message } }`);\n      if (ch.remove.length) parts.push(`r${j}: tagsRemove(id: ${id}, tags: ${JSON.stringify(ch.remove)}) { userErrors { field message } }`);\n    });\n    docs.push({ query: `mutation { ${parts.join(' ')} }`, customers: Math.min(cfg.batchSize, changes.length - i) });\n  }\n  return docs;\n}\n\n// Throws on GraphQL errors or any per-customer userErrors, so the cursor doesn't move past a failed page.\nfunction checkMutation(res) {\n  if (res.errors && res.errors.length) throw new Error('Shopify GraphQL: ' + res.errors.map((e) => e.message).join('; '));\n  const bad = [];\n  for (const [alias, r] of Object.entries(res.data || {})) for (const e of (r && r.userErrors) || []) bad.push(`${alias}: ${e.message}`);\n  if (bad.length) throw new Error('Shopify tag update failed: ' + bad.join('; '));\n  return Object.keys(res.data || {}).length;\n}\n\n// Rolling cursor: each run handles the next page; after the last page it starts over.\nconst nextCursor = (pageInfo) => (pageInfo && pageInfo.hasNextPage ? pageInfo.endCursor : null);\n\nconst CONFIG = {\"prefix\":\"seg:\",\"vipSpend\":1000,\"vipOrders\":8,\"loyalOrders\":3,\"newDays\":30,\"atRiskDays\":90,\"lapsedDays\":180,\"batchSize\":25};\n\n// ---- Plan Tags ----\nfunction gql(item) {\n  const b = item.json;\n  if (b.errors && b.errors.length) throw new Error('Shopify GraphQL: ' + b.errors.map((e) => e.message).join('; '));\n  if (!b.data) throw new Error('Shopify GraphQL: empty response');\n  return b.data;\n}\nconst page = gql($input.first()).customers;\nconst plan = planPage(page.nodes, new Date().toISOString(), CONFIG);\nconst cursor = nextCursor(page.pageInfo);\nconst docs = mutationBatches(plan.changes, CONFIG);\nif (!docs.length) $getWorkflowStaticData('global').cursor = cursor;\nreturn docs.map((d) => ({ json: { ...d, cursor, counts: plan.counts, changed: plan.changes.length } }));\n"
+      }
+    },
+    {
+      "id": "27ef2e84-a85a-4ef7-b1e3-b44c3c8b505f",
+      "name": "Update Tags",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "shopifyAccessTokenApi": {
+          "id": "SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify Access Token"
+        }
+      },
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-store.myshopify.com/admin/api/2026-07/graphql.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "shopifyAccessTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.query }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "e5897841-4250-4a3e-8cd9-6da04588eb23",
+      "name": "Save Cursor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// RFM-style customer segments as Shopify customer tags (\"seg:vip\", \"seg:at_risk\", ...), so marketing tools, Shopify\n// customer segments, discounts and support all see the same groups. Plain JS, no imports: build.mjs pastes it into the\n// n8n Code nodes; tests run the same functions.\n\nconst DEFAULTS = {\n  prefix: 'seg:',\n  vipSpend: 1000,    // lifetime spend (shop currency) ...\n  vipOrders: 8,      // ... or this many orders = VIP, while still active\n  loyalOrders: 3,\n  newDays: 30,       // first order this recent = new\n  atRiskDays: 90,    // repeat customer quiet for longer than this = at risk\n  lapsedDays: 180,   // no order for longer than this = lapsed\n  batchSize: 25,     // customers per GraphQL mutation request\n};\nconst cfgOf = (c) => ({ ...DEFAULTS, ...(c || {}) });\nconst num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };\nconst SEGMENTS = ['vip', 'loyal', 'active', 'new', 'one_time', 'at_risk', 'lapsed'];\n\n// customer: GraphQL Customer node. Returns one segment name, or null for customers with no orders.\nfunction segmentOf(customer, now, c) {\n  const cfg = cfgOf(c);\n  const orders = num(customer.numberOfOrders);\n  const last = customer.lastOrder && customer.lastOrder.createdAt;\n  if (!orders || !last) return null;\n  const quiet = (new Date(now).getTime() - new Date(last).getTime()) / 86400000;\n  const spent = num(customer.amountSpent && customer.amountSpent.amount);\n  if (quiet > cfg.lapsedDays) return 'lapsed';\n  if (quiet > cfg.atRiskDays) return orders >= 2 ? 'at_risk' : 'one_time';\n  if (spent >= cfg.vipSpend || orders >= cfg.vipOrders) return 'vip';\n  if (orders >= cfg.loyalOrders) return 'loyal';\n  if (orders === 1) return quiet <= cfg.newDays ? 'new' : 'one_time';\n  return 'active';\n}\n\n// Only touches tags with our prefix; every other tag on the customer is left alone.\nfunction tagChanges(customer, segment, c) {\n  const cfg = cfgOf(c);\n  const ours = (customer.tags || []).filter((t) => t.startsWith(cfg.prefix));\n  const want = segment ? [cfg.prefix + segment] : [];\n  return { add: want.filter((t) => !ours.includes(t)), remove: ours.filter((t) => !want.includes(t)) };\n}\n\n// One page of customers -> the changes to make + per-segment counts.\nfunction planPage(customers, now, c) {\n  const cfg = cfgOf(c);\n  const counts = {};\n  const changes = [];\n  for (const cu of customers || []) {\n    const seg = segmentOf(cu, now, cfg);\n    counts[seg || 'none'] = (counts[seg || 'none'] || 0) + 1;\n    const ch = tagChanges(cu, seg, cfg);\n    if (ch.add.length || ch.remove.length) changes.push({ id: cu.id, name: cu.displayName, segment: seg, ...ch });\n  }\n  return { changes, counts };\n}\n\n// Changes -> GraphQL mutation documents, batchSize customers each, using aliases (a0, r0, ...) so one request\n// updates many customers. JSON.stringify produces valid GraphQL string literals for ids and tags.\nfunction mutationBatches(changes, c) {\n  const cfg = cfgOf(c);\n  const docs = [];\n  for (let i = 0; i < changes.length; i += cfg.batchSize) {\n    const parts = [];\n    changes.slice(i, i + cfg.batchSize).forEach((ch, j) => {\n      const id = JSON.stringify(ch.id);\n      if (ch.add.length) parts.push(`a${j}: tagsAdd(id: ${id}, tags: ${JSON.stringify(ch.add)}) { userErrors { field message } }`);\n      if (ch.remove.length) parts.push(`r${j}: tagsRemove(id: ${id}, tags: ${JSON.stringify(ch.remove)}) { userErrors { field message } }`);\n    });\n    docs.push({ query: `mutation { ${parts.join(' ')} }`, customers: Math.min(cfg.batchSize, changes.length - i) });\n  }\n  return docs;\n}\n\n// Throws on GraphQL errors or any per-customer userErrors, so the cursor doesn't move past a failed page.\nfunction checkMutation(res) {\n  if (res.errors && res.errors.length) throw new Error('Shopify GraphQL: ' + res.errors.map((e) => e.message).join('; '));\n  const bad = [];\n  for (const [alias, r] of Object.entries(res.data || {})) for (const e of (r && r.userErrors) || []) bad.push(`${alias}: ${e.message}`);\n  if (bad.length) throw new Error('Shopify tag update failed: ' + bad.join('; '));\n  return Object.keys(res.data || {}).length;\n}\n\n// Rolling cursor: each run handles the next page; after the last page it starts over.\nconst nextCursor = (pageInfo) => (pageInfo && pageInfo.hasNextPage ? pageInfo.endCursor : null);\n\nconst CONFIG = {\"prefix\":\"seg:\",\"vipSpend\":1000,\"vipOrders\":8,\"loyalOrders\":3,\"newDays\":30,\"atRiskDays\":90,\"lapsedDays\":180,\"batchSize\":25};\n\n// ---- Save Cursor ----\nfor (const r of $input.all()) checkMutation(r.json);\nconst first = $('Plan Tags').first().json;\n$getWorkflowStaticData('global').cursor = first.cursor;\nreturn [{ json: { changed: first.changed, counts: first.counts, nextCursor: first.cursor } }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Cursor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cursor": {
+      "main": [
+        [
+          {
+            "node": "Get Customers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customers": {
+      "main": [
+        [
+          {
+            "node": "Plan Tags",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Tags": {
+      "main": [
+        [
+          {
+            "node": "Update Tags",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Tags": {
+      "main": [
+        [
+          {
+            "node": "Save Cursor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "notes": "Every run: next page of customers -> RFM segment -> \"seg:*\" tags added/removed only where they changed. Cycles through all customers."
+  }
+}

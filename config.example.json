@@ -1,0 +1,17 @@
+{
+  "shop": "your-store.myshopify.com",
+  "apiVersion": "2026-07",
+  "everyMinutes": 15,
+  "pageSize": 100,
+  "prefix": "seg:",
+  "vipSpend": 1000,
+  "vipOrders": 8,
+  "loyalOrders": 3,
+  "newDays": 30,
+  "atRiskDays": 90,
+  "lapsedDays": 180,
+  "batchSize": 25,
+  "credentials": {
+    "shopify": { "id": "SHOPIFY_CREDENTIAL_ID", "name": "Shopify Access Token" }
+  }
+}

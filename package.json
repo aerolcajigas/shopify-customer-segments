@@ -1,0 +1,14 @@
+{
+  "name": "shopify-customer-segments",
+  "version": "1.0.0",
+  "private": true,
+  "description": "n8n workflow: RFM-style customer segments written to Shopify as seg:* tags, incremental and batched.",
+  "scripts": {
+    "build": "node build.mjs",
+    "deploy": "node build.mjs --deploy",
+    "test": "node build.mjs && node --test test/core.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
